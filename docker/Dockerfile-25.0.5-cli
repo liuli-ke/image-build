@@ -1,0 +1,4 @@
+FROM docker:25.0.5-cli-alpine3.20
+
+# 安装 bash 以便脚本运行（docker:cli 基于 alpine，默认 sh 可能功能不足）
+RUN apk add --no-cache bash

@@ -1,4 +1,4 @@
-name: Build_Multi-Arch_Images_and_Release
+name: build-multi-arch-images
 
 on:
   workflow_dispatch:

@@ -3,23 +3,23 @@ name: build-multi-arch-images
 on:
   workflow_dispatch:
     inputs:
-      context:
-        description: '构建上下文路径（例如 "." 或 "./app"）'
+      working_directory:
+        description: '工作目录（Dockerfile 所在目录，相对于仓库根目录）'
         required: true
         default: '.'
       dockerfile:
-        description: 'Dockerfile 路径（例如 "Dockerfile" 或 "path/to/Dockerfile"）'
+        description: 'Dockerfile 文件名（位于工作目录下）'
         required: true
         default: 'Dockerfile'
       image_name:
-        description: '完整镜像名（例如 "liulike/image"）'
+        description: '完整镜像名（例如 "myregistry/myimage"）'
         required: true
       image_tag:
         description: '镜像标签（例如 "latest"）'
         required: true
         default: 'latest'
       release_tag:
-        description: 'Release 标签（默认使用镜像标签，建议使用唯一值，如 "v1.0.0"）'
+        description: 'Release 标签（可选，留空则使用镜像标签，注意：不能含空格，会自动转换）'
         required: false
         default: ''
 
@@ -27,8 +27,7 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write          # 允许创建 Release 和上传附件
-      packages: read           # 可选，如果需要从 GitHub Container Registry 拉取基础镜像
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -40,36 +39,43 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Validate inputs
+      - name: Validate inputs and change to working directory
         run: |
+          # 检查工作目录是否存在
+          if [ ! -d "${{ inputs.working_directory }}" ]; then
+            echo "错误：工作目录不存在 -> ${{ inputs.working_directory }}"
+            exit 1
+          fi
+          cd "${{ inputs.working_directory }}"
+          # 检查 Dockerfile 是否存在
           if [ ! -f "${{ inputs.dockerfile }}" ]; then
-            echo "错误：Dockerfile 文件不存在 -> ${{ inputs.dockerfile }}"
+            echo "错误：Dockerfile 不存在于工作目录下 -> ${{ inputs.working_directory }}/${{ inputs.dockerfile }}"
             exit 1
           fi
-          if [ ! -d "${{ inputs.context }}" ]; then
-            echo "错误：构建上下文目录不存在 -> ${{ inputs.context }}"
-            exit 1
-          fi
+          # 将工作目录路径保存到环境变量，供后续步骤使用（因为后续步骤需要 cd 回来或知道路径）
+          echo "WORKING_DIR=$(pwd)" >> $GITHUB_ENV
 
       - name: Build and load amd64 image
         run: |
+          cd "${{ inputs.working_directory }}"
           docker buildx build \
             --platform linux/amd64 \
             -t "${{ inputs.image_name }}:${{ inputs.image_tag }}-amd64" \
             -f "${{ inputs.dockerfile }}" \
-            "${{ inputs.context }}" \
+            . \
             --load
 
       - name: Build and load arm64 image
         run: |
+          cd "${{ inputs.working_directory }}"
           docker buildx build \
             --platform linux/arm64 \
             -t "${{ inputs.image_name }}:${{ inputs.image_tag }}-arm64" \
             -f "${{ inputs.dockerfile }}" \
-            "${{ inputs.context }}" \
+            . \
             --load
 
-      - name: Generate short image name (last part after last '/')
+      - name: Generate short image name
         id: short_name
         run: |
           short_name="${image_name##*/}"
@@ -90,20 +96,23 @@ jobs:
         run: |
           md5sum "${{ env.TAR_FILE }}" > "${{ env.TAR_FILE }}.md5"
 
-      - name: Determine release tag
-        id: release_tag
+      - name: Sanitize tag name
+        id: sanitize
         run: |
-          if [ -z "${{ inputs.release_tag }}" ]; then
-            echo "tag=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          raw_tag="${{ inputs.release_tag }}"
+          if [ -z "$raw_tag" ]; then
+            raw_tag="${{ inputs.image_tag }}"
           fi
+          # 将非法字符（空格、斜杠、冒号等）替换为连字符，并去除首尾的非法字符
+          sanitized=$(echo "$raw_tag" | sed -e 's/[^a-zA-Z0-9._-]/-/g' -e 's/^[-._]*//' -e 's/[-._]*$//')
+          echo "sanitized_tag=$sanitized" >> $GITHUB_OUTPUT
+          echo "原始 tag: $raw_tag -> 清理后: $sanitized"
 
       - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_tag.outputs.tag }}
-          name: Release ${{ steps.release_tag.outputs.tag }}
+          tag_name: ${{ steps.sanitize.outputs.sanitized_tag }}
+          name: Release ${{ steps.sanitize.outputs.sanitized_tag }}
           draft: false
           prerelease: false
           files: |

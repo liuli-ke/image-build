@@ -1,0 +1,4 @@
+FROM moby/buildkit:buildx-stable-1
+
+# 1. 安装 ca-certificates 包  buildx-stable-1 基于 Alpine，需要先安装。
+RUN apk add --no-cache ca-certificates

@@ -1,0 +1,98 @@
+name: download-multi-arch-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_full:
+        description: '完整镜像引用（例如 "docker.io/tonistiigi/binfmt:qemu-v10.2.1-65"）'
+        required: true
+      release_tag:
+        description: 'Release 标签（可选，留空则使用镜像标签，注意：不能含空格，会自动转换）'
+        required: false
+        default: ''
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse image name and tag
+        id: parse
+        run: |
+          full="${{ inputs.image_full }}"
+          # 如果包含冒号，取最后冒号后为 tag，否则 tag 为 latest
+          if [[ "$full" == *:* ]]; then
+            tag="${full##*:}"
+            repo="${full%:*}"
+          else
+            tag="latest"
+            repo="$full"
+          fi
+          echo "repo=$repo" >> $GITHUB_OUTPUT
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "解析结果: repo=$repo, tag=$tag"
+
+      - name: Pull and tag amd64 image
+        run: |
+          docker pull --platform linux/amd64 "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}"
+          docker tag "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}" "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}-amd64"
+
+      - name: Pull and tag arm64 image
+        run: |
+          docker pull --platform linux/arm64 "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}"
+          docker tag "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}" "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}-arm64"
+
+      - name: Generate filename
+        id: naming
+        run: |
+          # 提取最后一个 '/' 之后的内容作为短名
+          short_name="${repo##*/}"
+          tag="${{ steps.parse.outputs.tag }}"
+          # 构建文件名: 短名-标签-multi_arch.tar.gz
+          tar_file="${short_name}-${tag}-multi_arch.tar.gz"
+          echo "tar_file=$tar_file" >> $GITHUB_OUTPUT
+          echo "生成文件名: $tar_file"
+        env:
+          repo: ${{ steps.parse.outputs.repo }}
+
+      - name: Save and compress multi-arch images
+        run: |
+          docker save \
+            "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}-amd64" \
+            "${{ steps.parse.outputs.repo }}:${{ steps.parse.outputs.tag }}-arm64" \
+            | gzip > "${{ steps.naming.outputs.tar_file }}"
+
+      - name: Generate MD5 checksum
+        run: |
+          md5sum "${{ steps.naming.outputs.tar_file }}" > "${{ steps.naming.outputs.tar_file }}.md5"
+
+      - name: Sanitize release tag name
+        id: sanitize
+        run: |
+          raw_tag="${{ inputs.release_tag }}"
+          if [ -z "$raw_tag" ]; then
+            raw_tag="${{ steps.parse.outputs.tag }}"
+          fi
+          # 将非法字符（空格、斜杠、冒号等）替换为连字符，并去除首尾的非法字符
+          sanitized=$(echo "$raw_tag" | sed -e 's/[^a-zA-Z0-9._-]/-/g' -e 's/^[-._]*//' -e 's/[-._]*$//')
+          echo "sanitized_tag=$sanitized" >> $GITHUB_OUTPUT
+          echo "原始 tag: $raw_tag -> 清理后: $sanitized"
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sanitize.outputs.sanitized_tag }}
+          name: Release ${{ steps.sanitize.outputs.sanitized_tag }}
+          draft: false
+          prerelease: false
+          files: |
+            ${{ steps.naming.outputs.tar_file }}
+            ${{ steps.naming.outputs.tar_file }}.md5
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

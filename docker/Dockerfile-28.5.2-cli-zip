@@ -1,4 +1,4 @@
 FROM docker:28.5.2-cli-alpine3.22
 
 # 安装 bash 以便脚本运行（docker:cli 基于 alpine，默认 sh 可能功能不足）
-RUN apk add --no-cache bash unzip unrar p7zip
+RUN apk add --no-cache bash unzip p7zip

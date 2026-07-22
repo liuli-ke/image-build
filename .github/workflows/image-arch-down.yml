@@ -1,0 +1,154 @@
+name: download-arch-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      images:
+        description: '多个镜像引用，用逗号或分号分隔，例如 "gitlab/gitlab-ce:10.0.7-ce.0,gitlab/gitlab-ce:10.8.7-ce.0"'
+        required: true
+      arch:
+        description: '目标架构，如 "linux/amd64" 或 "linux/arm64"（也支持 "amd64"、"arm64"）'
+        required: true
+        default: 'linux/amd64'
+      release_tag:
+        description: 'Release 标签（可选，留空则自动生成），不能含空格，会自动转换'
+        required: false
+        default: ''
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse images list
+        id: parse-images
+        run: |
+          input="${{ inputs.images }}"
+          echo "原始输入: $input"
+          # 替换分号为逗号，按逗号分割，去除首尾空格及空行
+          cleaned=$(echo "$input" | sed 's/;/ ,/g' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$')
+          echo "解析后的镜像列表："
+          echo "$cleaned"
+          # 将列表写入临时文件，供后续步骤读取
+          echo "$cleaned" > /tmp/images_list.txt
+          # 取第一行作为 first_image
+          first=$(head -n1 /tmp/images_list.txt)
+          echo "first_image=$first" >> $GITHUB_OUTPUT
+          # 同时将列表作为输出（可选）
+          echo "images<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/images_list.txt
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Normalize architecture
+        id: arch
+        run: |
+          arch_input="${{ inputs.arch }}"
+          if [[ "$arch_input" != */* ]]; then
+            arch_input="linux/$arch_input"
+          fi
+          echo "platform=$arch_input" >> $GITHUB_OUTPUT
+          echo "使用平台: $arch_input"
+
+      - name: Pull images for specified architecture
+        run: |
+          platform="${{ steps.arch.outputs.platform }}"
+          # 从文件读取镜像列表
+          while IFS= read -r img; do
+            if [ -z "$img" ]; then continue; fi
+            echo "拉取镜像: $img (平台: $platform)"
+            docker pull --platform "$platform" "$img"
+          done < /tmp/images_list.txt
+
+      - name: Generate manifest file
+        run: |
+          echo "包含以下镜像（架构：${{ steps.arch.outputs.platform }}）：" > manifest.txt
+          while IFS= read -r img; do
+            if [ -z "$img" ]; then continue; fi
+            echo "- $img" >> manifest.txt
+          done < /tmp/images_list.txt
+          echo "" >> manifest.txt
+          echo "所有镜像均拉取自 ${{ steps.arch.outputs.platform }} 平台。" >> manifest.txt
+
+      - name: Generate archive filename
+        id: naming
+        run: |
+          first="${{ steps.parse-images.outputs.first_image }}"
+          # 如果 first 为空，则从文件读取第一行
+          if [ -z "$first" ]; then
+            first=$(head -n1 /tmp/images_list.txt)
+          fi
+          short_repo=$(echo "$first" | cut -d':' -f1 | sed 's|.*/||')
+          first_tag=$(echo "$first" | cut -d':' -f2)
+          count=$(wc -l < /tmp/images_list.txt | xargs)
+          arch_short=$(echo "${{ steps.arch.outputs.platform }}" | cut -d'/' -f2)
+          tar_file="${short_repo}-${first_tag}-and-${count}-more-${arch_short}.tar.gz"
+          echo "tar_file=$tar_file" >> $GITHUB_OUTPUT
+          echo "生成文件名: $tar_file"
+
+      - name: Save and compress all images
+        run: |
+          # 从文件读取所有镜像，构建空格分隔的列表
+          images_to_save=""
+          while IFS= read -r img; do
+            if [ -z "$img" ]; then continue; fi
+            images_to_save="$images_to_save $img"
+          done < /tmp/images_list.txt
+          # 去除首尾空格
+          images_to_save=$(echo "$images_to_save" | xargs)
+          if [ -z "$images_to_save" ]; then
+            echo "错误：没有要保存的镜像，请检查输入参数。"
+            exit 1
+          fi
+          echo "将保存以下镜像: $images_to_save"
+          docker save $images_to_save | gzip > "${{ steps.naming.outputs.tar_file }}"
+
+      - name: Generate MD5 checksum
+        run: |
+          md5sum "${{ steps.naming.outputs.tar_file }}" > "${{ steps.naming.outputs.tar_file }}.md5"
+
+      - name: Get manifest content for release body
+        id: manifest_content
+        run: |
+          content=$(cat manifest.txt)
+          echo "manifest_body<<EOF" >> $GITHUB_OUTPUT
+          echo "$content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Sanitize release tag name
+        id: sanitize
+        run: |
+          raw_tag="${{ inputs.release_tag }}"
+          if [ -z "$raw_tag" ]; then
+            first_tag="${{ steps.parse-images.outputs.first_image }}"
+            if [ -z "$first_tag" ]; then
+              first_tag=$(head -n1 /tmp/images_list.txt | cut -d':' -f2)
+            fi
+            arch_short="${{ steps.arch.outputs.platform }}"
+            arch_short="${arch_short##*/}"
+            raw_tag="${first_tag}-${arch_short}"
+          fi
+          sanitized=$(echo "$raw_tag" | sed -e 's/[^a-zA-Z0-9._-]/-/g' -e 's/^[-._]*//' -e 's/[-._]*$//')
+          echo "sanitized_tag=$sanitized" >> $GITHUB_OUTPUT
+          echo "原始 tag: $raw_tag -> 清理后: $sanitized"
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sanitize.outputs.sanitized_tag }}
+          name: Release ${{ steps.sanitize.outputs.sanitized_tag }}
+          draft: false
+          prerelease: false
+          files: |
+            ${{ steps.naming.outputs.tar_file }}
+            ${{ steps.naming.outputs.tar_file }}.md5
+            manifest.txt
+          generate_release_notes: true
+          body: |
+            ${{ steps.manifest_content.outputs.manifest_body }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
